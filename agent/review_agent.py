@@ -103,9 +103,11 @@ Instructions:
 - Return only concise, actionable review comments.
 - Do not praise the code.
 - Do not invent issues that are not grounded in the diff.
-- Use the provided `position` value exactly as shown in the diff chunk.
+- Anchor each comment to the exact `new_line` that contains the issue.
+- Prefer commenting on added lines. Use nearby context lines only when needed.
+- Never choose a line near the issue; choose the line that best represents it.
 - Return a JSON object with a single key named `comments`.
-- Each item in `comments` must be an object with `path`, `position`, and `body`.
+- Each item in `comments` must be an object with `path`, `line`, and `body`.
 - If there are no issues, return {{"comments": []}}.
 
 Diff chunk:
@@ -124,7 +126,7 @@ def normalize_json_payload(payload_text: str) -> Dict:
 
 
 def extract_comments_from_response(payload: Dict) -> List[dict]:
-    """Validate and normalize the model response into GitHub comment dicts."""
+    """Validate and normalize the model response into line-anchored comment dicts."""
 
     raw_comments = payload.get("comments", [])
     if not isinstance(raw_comments, list):
@@ -136,41 +138,49 @@ def extract_comments_from_response(payload: Dict) -> List[dict]:
             continue
 
         path = item.get("path")
-        position = item.get("position")
+        line = item.get("line")
         body = item.get("body")
 
         if not isinstance(path, str) or not path:
             continue
-        if not isinstance(position, int):
+        if not isinstance(line, int):
             continue
         if not isinstance(body, str) or not body.strip():
             continue
 
-        comments.append({"path": path, "position": position, "body": body.strip()})
+        comments.append(
+            {
+                "path": path,
+                "line": line,
+                "side": "RIGHT",
+                "body": body.strip(),
+            }
+        )
 
     return comments
 
 
 def valid_comment_targets(hunks: Iterable[DiffHunk]) -> set[tuple[str, int]]:
-    """Return the set of `(path, position)` pairs that exist in the parsed diff."""
+    """Return the set of `(path, new_line)` pairs that can accept RIGHT-side comments."""
 
     targets: set[tuple[str, int]] = set()
     for hunk in hunks:
         for line in hunk.lines:
-            targets.add((hunk.filename, line.position))
+            if line.new_line_number is not None:
+                targets.add((hunk.filename, line.new_line_number))
     return targets
 
 
 def filter_valid_comments(comments: Iterable[dict], hunks: Iterable[DiffHunk]) -> List[dict]:
-    """Drop comments that do not point at valid diff positions."""
+    """Drop comments that do not point at valid new-file line numbers."""
 
     valid_targets = valid_comment_targets(hunks)
     filtered: List[dict] = []
     seen: set[tuple[str, int, str]] = set()
 
     for comment in comments:
-        key = (comment["path"], comment["position"], comment["body"])
-        target = (comment["path"], comment["position"])
+        key = (comment["path"], comment["line"], comment["body"])
+        target = (comment["path"], comment["line"])
         if target not in valid_targets or key in seen:
             continue
         filtered.append(comment)

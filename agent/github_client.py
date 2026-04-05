@@ -10,14 +10,15 @@ The review agent should orchestrate business logic, not carry around GitHub
 transport details. This wrapper keeps the integration narrow and readable.
 
 How the key mechanism works:
-Inline comments are posted through GitHub's review API with a diff `position`.
-That position is not a file line number; it is the line's offset inside the PR
-diff for that file. The parser computes those positions, and this client sends
-them back to GitHub unchanged.
+Inline comments are posted through GitHub's review API using `line` and `side`
+for more stable placement. We still parse diff positions for analysis, but when
+it is time to post comments, we anchor them to concrete file lines on the RIGHT
+side of the diff whenever possible.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Iterable, List
 from urllib import request
 
@@ -67,12 +68,24 @@ class GitHubReviewClient:
         if not bounded_comments:
             return
 
-        repository = self.github.get_repo(repo_name)
-        pull_request = repository.get_pull(pr_number)
-        commit = repository.get_commit(commit_sha)
-        pull_request.create_review(
-            commit=commit,
-            body="Automated AI review suggestions.",
-            event="COMMENT",
-            comments=bounded_comments,
+        review_request = request.Request(
+            f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/reviews",
+            data=json.dumps(
+                {
+                    "commit_id": commit_sha,
+                    "body": "Automated AI review suggestions.",
+                    "event": "COMMENT",
+                    "comments": bounded_comments,
+                }
+            ).encode("utf-8"),
+            method="POST",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+                "User-Agent": "ai-code-review-bot",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
         )
+        with request.urlopen(review_request):
+            return
