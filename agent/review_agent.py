@@ -107,7 +107,8 @@ Instructions:
 - Prefer commenting on added lines. Use nearby context lines only when needed.
 - Never choose a line near the issue; choose the line that best represents it.
 - Return a JSON object with a single key named `comments`.
-- Each item in `comments` must be an object with `path`, `line`, and `body`.
+- Each item in `comments` must be an object with `path`, `line`, `line_text`, and `body`.
+- `line_text` must exactly match the full code text of the target diff line, without diff markers.
 - If there are no issues, return {{"comments": []}}.
 
 Diff chunk:
@@ -139,11 +140,14 @@ def extract_comments_from_response(payload: Dict) -> List[dict]:
 
         path = item.get("path")
         line = item.get("line")
+        line_text = item.get("line_text")
         body = item.get("body")
 
         if not isinstance(path, str) or not path:
             continue
         if not isinstance(line, int):
+            continue
+        if not isinstance(line_text, str) or not line_text.strip():
             continue
         if not isinstance(body, str) or not body.strip():
             continue
@@ -152,6 +156,7 @@ def extract_comments_from_response(payload: Dict) -> List[dict]:
             {
                 "path": path,
                 "line": line,
+                "line_text": line_text.strip(),
                 "side": "RIGHT",
                 "body": body.strip(),
             }
@@ -169,6 +174,43 @@ def valid_comment_targets(hunks: Iterable[DiffHunk]) -> set[tuple[str, int]]:
             if line.new_line_number is not None:
                 targets.add((hunk.filename, line.new_line_number))
     return targets
+
+
+def resolve_comment_lines(comments: Iterable[dict], hunks: Iterable[DiffHunk]) -> List[dict]:
+    """Snap comments to exact diff lines by matching the model's quoted line text."""
+
+    indexed_lines: dict[str, List[DiffHunk]] = {}
+    for hunk in hunks:
+        indexed_lines.setdefault(hunk.filename, []).append(hunk)
+
+    resolved: List[dict] = []
+    for comment in comments:
+        path = comment["path"]
+        requested_line = comment["line"]
+        requested_text = comment["line_text"].strip()
+
+        best_match = None
+        best_distance = None
+        for hunk in indexed_lines.get(path, []):
+            for line in hunk.lines:
+                if line.new_line_number is None:
+                    continue
+                if line.content.strip() != requested_text:
+                    continue
+
+                distance = abs(line.new_line_number - requested_line)
+                if best_match is None or distance < best_distance:
+                    best_match = line
+                    best_distance = distance
+
+        normalized_comment = dict(comment)
+        if best_match is not None:
+            normalized_comment["line"] = best_match.new_line_number
+
+        normalized_comment.pop("line_text", None)
+        resolved.append(normalized_comment)
+
+    return resolved
 
 
 def filter_valid_comments(comments: Iterable[dict], hunks: Iterable[DiffHunk]) -> List[dict]:
@@ -216,7 +258,8 @@ def review_diff_chunk(client: OpenAI, rules: Sequence[str], hunks: Sequence[Diff
     except (JSONDecodeError, ValueError):
         return []
 
-    return filter_valid_comments(comments, hunks)
+    resolved_comments = resolve_comment_lines(comments, hunks)
+    return filter_valid_comments(resolved_comments, hunks)
 
 
 def main() -> None:
