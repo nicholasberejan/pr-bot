@@ -27,7 +27,7 @@ from typing import Dict, Iterable, List, Sequence
 import yaml
 from openai import OpenAI
 
-from diff_parser import DiffHunk, parse_unified_diff, render_hunks_for_prompt
+from diff_parser import DiffHunk, parse_unified_diff
 from github_client import GitHubReviewClient
 
 
@@ -88,11 +88,11 @@ def chunk_hunks(hunks: Sequence[DiffHunk], max_lines: int = MAX_DIFF_LINES_PER_C
     return chunks
 
 
-def build_prompt(rules: Sequence[str], hunks: Sequence[DiffHunk]) -> str:
+def build_prompt(rules: Sequence[str], hunks: Sequence[DiffHunk], anchor_map: Dict[str, dict]) -> str:
     """Create the user prompt sent to the OpenAI model for one diff chunk."""
 
     rendered_rules = "\n".join(f"- {rule}" for rule in rules)
-    rendered_diff = render_hunks_for_prompt(list(hunks))
+    rendered_diff = render_hunks_with_anchors(hunks, anchor_map)
 
     return f"""Review the following pull request diff chunk.
 
@@ -103,12 +103,11 @@ Instructions:
 - Return only concise, actionable review comments.
 - Do not praise the code.
 - Do not invent issues that are not grounded in the diff.
-- Anchor each comment to the exact `new_line` that contains the issue.
-- Prefer commenting on added lines. Use nearby context lines only when needed.
-- Never choose a line near the issue; choose the line that best represents it.
+- Use only the provided `anchor_id` values when placing comments.
+- Choose the single best `anchor_id` for the issue. Do not approximate.
+- Prefer anchors on added lines. Use context-line anchors only when necessary.
 - Return a JSON object with a single key named `comments`.
-- Each item in `comments` must be an object with `path`, `line`, `line_text`, and `body`.
-- `line_text` must exactly match the full code text of the target diff line, without diff markers.
+- Each item in `comments` must be an object with `path`, `anchor_id`, and `body`.
 - If there are no issues, return {{"comments": []}}.
 
 Diff chunk:
@@ -127,7 +126,7 @@ def normalize_json_payload(payload_text: str) -> Dict:
 
 
 def extract_comments_from_response(payload: Dict) -> List[dict]:
-    """Validate and normalize the model response into line-anchored comment dicts."""
+    """Validate and normalize the model response into anchor-based comment dicts."""
 
     raw_comments = payload.get("comments", [])
     if not isinstance(raw_comments, list):
@@ -139,15 +138,12 @@ def extract_comments_from_response(payload: Dict) -> List[dict]:
             continue
 
         path = item.get("path")
-        line = item.get("line")
-        line_text = item.get("line_text")
+        anchor_id = item.get("anchor_id")
         body = item.get("body")
 
         if not isinstance(path, str) or not path:
             continue
-        if not isinstance(line, int):
-            continue
-        if not isinstance(line_text, str) or not line_text.strip():
+        if not isinstance(anchor_id, str) or not anchor_id.strip():
             continue
         if not isinstance(body, str) or not body.strip():
             continue
@@ -155,14 +151,87 @@ def extract_comments_from_response(payload: Dict) -> List[dict]:
         comments.append(
             {
                 "path": path,
-                "line": line,
-                "line_text": line_text.strip(),
-                "side": "RIGHT",
+                "anchor_id": anchor_id.strip(),
                 "body": body.strip(),
             }
         )
 
     return comments
+
+
+def build_anchor_map(hunks: Sequence[DiffHunk]) -> Dict[str, dict]:
+    """Build stable anchor ids for commentable lines in a chunk."""
+
+    anchor_map: Dict[str, dict] = {}
+    anchor_number = 1
+
+    for hunk in hunks:
+        for line in hunk.lines:
+            if line.new_line_number is None:
+                continue
+
+            anchor_id = f"A{anchor_number}"
+            anchor_map[anchor_id] = {
+                "path": hunk.filename,
+                "line": line.new_line_number,
+                "side": "RIGHT",
+                "line_type": line.line_type,
+                "content": line.content,
+            }
+            anchor_number += 1
+
+    return anchor_map
+
+
+def render_hunks_with_anchors(hunks: Sequence[DiffHunk], anchor_map: Dict[str, dict]) -> str:
+    """Render diff hunks with explicit anchor ids for every commentable line."""
+
+    anchor_lookup: Dict[tuple[str, int], str] = {}
+    for anchor_id, metadata in anchor_map.items():
+        anchor_lookup[(metadata["path"], metadata["line"])] = anchor_id
+
+    rendered_chunks: List[str] = []
+    current_file = None
+
+    for hunk in hunks:
+        if hunk.filename != current_file:
+            current_file = hunk.filename
+            rendered_chunks.append(f"FILE: {hunk.filename}")
+
+        rendered_chunks.append(f"HUNK: {hunk.header}")
+        for line in hunk.lines:
+            old_line = line.old_line_number if line.old_line_number is not None else "null"
+            new_line = line.new_line_number if line.new_line_number is not None else "null"
+            anchor_id = ""
+            if line.new_line_number is not None:
+                anchor_id = anchor_lookup.get((hunk.filename, line.new_line_number), "")
+            rendered_chunks.append(
+                f"[anchor_id={anchor_id}][type={line.line_type}]"
+                f"[old_line={old_line}][new_line={new_line}] {line.content}"
+            )
+
+    return "\n".join(rendered_chunks)
+
+
+def resolve_comment_anchors(comments: Iterable[dict], anchor_map: Dict[str, dict]) -> List[dict]:
+    """Convert model-selected anchor ids into GitHub review comment payloads."""
+
+    resolved: List[dict] = []
+    for comment in comments:
+        anchor = anchor_map.get(comment["anchor_id"])
+        if anchor is None or anchor["path"] != comment["path"]:
+            continue
+
+        resolved.append(
+            {
+                "path": anchor["path"],
+                "line": anchor["line"],
+                "side": anchor["side"],
+                "body": comment["body"],
+            }
+        )
+
+    return resolved
 
 
 def valid_comment_targets(hunks: Iterable[DiffHunk]) -> set[tuple[str, int]]:
@@ -174,43 +243,6 @@ def valid_comment_targets(hunks: Iterable[DiffHunk]) -> set[tuple[str, int]]:
             if line.new_line_number is not None:
                 targets.add((hunk.filename, line.new_line_number))
     return targets
-
-
-def resolve_comment_lines(comments: Iterable[dict], hunks: Iterable[DiffHunk]) -> List[dict]:
-    """Snap comments to exact diff lines by matching the model's quoted line text."""
-
-    indexed_lines: dict[str, List[DiffHunk]] = {}
-    for hunk in hunks:
-        indexed_lines.setdefault(hunk.filename, []).append(hunk)
-
-    resolved: List[dict] = []
-    for comment in comments:
-        path = comment["path"]
-        requested_line = comment["line"]
-        requested_text = comment["line_text"].strip()
-
-        best_match = None
-        best_distance = None
-        for hunk in indexed_lines.get(path, []):
-            for line in hunk.lines:
-                if line.new_line_number is None:
-                    continue
-                if line.content.strip() != requested_text:
-                    continue
-
-                distance = abs(line.new_line_number - requested_line)
-                if best_match is None or distance < best_distance:
-                    best_match = line
-                    best_distance = distance
-
-        normalized_comment = dict(comment)
-        if best_match is not None:
-            normalized_comment["line"] = best_match.new_line_number
-
-        normalized_comment.pop("line_text", None)
-        resolved.append(normalized_comment)
-
-    return resolved
 
 
 def filter_valid_comments(comments: Iterable[dict], hunks: Iterable[DiffHunk]) -> List[dict]:
@@ -238,7 +270,8 @@ def review_diff_chunk(client: OpenAI, rules: Sequence[str], hunks: Sequence[Diff
         "You are a senior code reviewer. Focus on correctness, security, "
         "maintainability, and actionable feedback. Respond with valid JSON only."
     )
-    user_prompt = build_prompt(rules, hunks)
+    anchor_map = build_anchor_map(hunks)
+    user_prompt = build_prompt(rules, hunks, anchor_map)
 
     response = client.chat.completions.create(
         model=MODEL_NAME,
@@ -258,7 +291,7 @@ def review_diff_chunk(client: OpenAI, rules: Sequence[str], hunks: Sequence[Diff
     except (JSONDecodeError, ValueError):
         return []
 
-    resolved_comments = resolve_comment_lines(comments, hunks)
+    resolved_comments = resolve_comment_anchors(comments, anchor_map)
     return filter_valid_comments(resolved_comments, hunks)
 
 
