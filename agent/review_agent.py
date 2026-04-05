@@ -42,9 +42,12 @@ def read_required_env(name: str) -> str:
     """Return a required environment variable or raise a helpful error."""
 
     value = os.getenv(name)
-    if not value:
+    if value is None:
         raise EnvironmentError(f"Missing required environment variable: {name}")
-    return value
+    normalized = value.strip()
+    if not normalized:
+        raise EnvironmentError(f"Missing required environment variable: {name}")
+    return normalized
 
 
 def load_team_rules(rules_path: Path) -> List[str]:

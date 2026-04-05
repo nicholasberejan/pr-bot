@@ -67,9 +67,11 @@ class GitHubReviewClient:
         if not bounded_comments:
             return
 
-        pull_request = self.github.get_repo(repo_name).get_pull(pr_number)
+        repository = self.github.get_repo(repo_name)
+        pull_request = repository.get_pull(pr_number)
+        commit = repository.get_commit(commit_sha)
         pull_request.create_review(
-            commit=commit_sha,
+            commit=commit,
             body="Automated AI review suggestions.",
             event="COMMENT",
             comments=bounded_comments,
