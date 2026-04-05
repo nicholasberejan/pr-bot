@@ -1,0 +1,12 @@
+rules:
+  - "No hardcoded secrets or API keys."
+  - "Functions should have docstrings."
+  - "Avoid deeply nested conditionals (more than 3 levels)."
+  - "No print() statements in production code; use logging instead."
+  - "Flag any TODO or FIXME comments."
+  - "Functions and methods should do one thing; flag any function exceeding 40 lines."
+  - "Avoid magic numbers and magic strings; constants should be named and defined at the top of the file."
+  - "All caught exceptions should be handled or re-raised with context — never silently swallowed with a bare except or empty catch block."
+  - "Avoid deeply nested callbacks or promise chains; prefer async/await."
+  - "Flag any commented-out code blocks — they should be deleted, not left in."
+  - "No mutable default arguments in function signatures."

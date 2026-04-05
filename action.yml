@@ -1,0 +1,44 @@
+name: "AI Code Review Bot"
+description: "Review pull request diffs with OpenAI and post inline GitHub review comments."
+
+inputs:
+  openai_api_key:
+    description: "OpenAI API key used to analyze the pull request diff."
+    required: true
+  github_token:
+    description: "GitHub token used to read pull requests and post review comments."
+    required: false
+    default: ${{ github.token }}
+  pr_number:
+    description: "Pull request number to review."
+    required: true
+  repo_name:
+    description: "Repository name in owner/repo format."
+    required: true
+  rules_file:
+    description: "Path inside the consuming repository to a YAML rules file."
+    required: false
+    default: ".github/ai-review/team_rules.yml"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install action dependencies
+      shell: bash
+      run: pip install -r "${{ github.action_path }}/requirements.txt"
+
+    - name: Run AI review agent
+      shell: bash
+      env:
+        OPENAI_API_KEY: ${{ inputs.openai_api_key }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        REPO_NAME: ${{ inputs.repo_name }}
+        RULES_FILE: ${{ github.workspace }}/${{ inputs.rules_file }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: python "${{ github.action_path }}/agent/review_agent.py"
